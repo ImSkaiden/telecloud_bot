@@ -22,7 +22,7 @@ async def check_token(user_token: str):
         URL = "https://cloud.onlysq.ru/api/files"
         async with session.get(URL, cookies={"user_token": user_token}) as response:
             jsn = await response.json()
-            return jsn.ok
+            return jsn.get("ok", False)
 
 async def upload_file(file_path: str, user_token: str):
     URL = "https://cloud.onlysq.ru/upload"
