@@ -123,5 +123,14 @@ translations_buttons = {
     "generate_token": {
         "en": "Generate token",
         "ru": "Сгенерировать токен"
-    }
+    },
+    "next_page_button": {
+        "en": ">>",
+        "ru": ">>"
+    },
+    "previous_page_button": {
+        "en": "<<",
+        "ru": "<<"
+    },
+    
 }
