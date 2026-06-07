@@ -12,16 +12,16 @@ translations_messages = {
         "ru": "Пожалуйста, отправьте файл, который вы хотите загрузить.\nДо <b>2</b> ГБ."
     },
     "upload_success": {
-        "en": "Your file has been uploaded successfully!\nFile ID: {}\nFile link: {}\n Direct link for download: {}\nPreview link: {}",
-        "ru": "Ваш файл успешно загружен!\nID файла: {}\nСсылка на файл: {}\nПрямая ссылка для скачивания: {}\nСсылка на превью: {}"
+        "en": "Your file has been uploaded successfully!\nFile ID: <code>{}</code>\nName: {}\nSize: {}\nShare link: {}",
+        "ru": "Ваш файл успешно загружен!\nID файла: <code>{}</code>\nИмя: {}\nРазмер: {}\nСсылка для доступа: {}"
     },
     "upload_failure": {
         "en": "Failed to upload the file. Please try again later and check your token.",
         "ru": "Не удалось загрузить файл. Пожалуйста, попробуйте позже и проверьте свой токен."
     },
     "upload_no_token": {
-        "en": "You need to set your user token before uploading files.",
-        "ru": "Вам нужно установить ваш пользовательский токен перед загрузкой файлов."
+        "en": "You need to set your API token before uploading files.\nCreate one at https://cloud.onlysq.ru/v2/ui/settings and send it via /settoken.",
+        "ru": "Вам нужно установить API-токен перед загрузкой файлов.\nСоздайте его на https://cloud.onlysq.ru/v2/ui/settings и отправьте через /settoken."
     },
     "files": {
         "en": "Your files:",
@@ -44,12 +44,12 @@ translations_messages = {
         "ru": "Ваш токен успешно установлен."
     },
     "settings_message": {
-        "en": "Settings:\nToken: <span class='tg-spoiler'>{}</span>",
-        "ru": "Настройки:\nТокен: <span class='tg-spoiler'>{}</span>"
+        "en": "Settings:\nAPI token: <span class='tg-spoiler'>{}</span>",
+        "ru": "Настройки:\nAPI-токен: <span class='tg-spoiler'>{}</span>"
     },
     "file_details": {
-        "en": "File Name: {}\nViews: {}\nUnique views: {}\nFile link: {}\n Direct link for download: {}\nPreview link: {}",
-        "ru": "Имя файла: {}\nПросмотры: {}\nУникальные просмотры: {}\nСсылка на файл: {}\nПрямая ссылка для скачивания: {}\nСсылка на превью: {}"
+        "en": "File Name: {}\nSize: {}\nType: {}\nViews: {}\nUploaded: {}\nShare link: {}",
+        "ru": "Имя файла: {}\nРазмер: {}\nТип: {}\nПросмотры: {}\nЗагружен: {}\nСсылка для доступа: {}"
     },
     "file_download_failure": {
         "en": "Failed to download the file.",
@@ -82,6 +82,10 @@ translations_messages = {
     "uploading_file": {
         "en": "Uploading file...",
         "ru": "Выгружаю файл..."
+    },
+    "generate_token_info": {
+        "en": "API tokens are created in the web UI.\n\n1. Open https://cloud.onlysq.ru/v2/ui/settings\n2. Create a new token (scopes: read, write, share)\n3. Copy the <code>tck_...</code> token and send it here via /settoken",
+        "ru": "API-токены создаются в веб-интерфейсе.\n\n1. Откройте https://cloud.onlysq.ru/v2/ui/settings\n2. Создайте новый токен (scopes: read, write, share)\n3. Скопируйте токен <code>tck_...</code> и отправьте сюда через /settoken"
     }
     
 

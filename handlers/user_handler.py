@@ -7,9 +7,14 @@ from aiogram.types import BufferedInputFile
 from translations import translations_messages as tm
 from translations import translations_buttons as tb
 import keyboards as kbs
-import aiohttp, os, aiofiles, logging, re
-from datetime import datetime
+import aiohttp, os, aiofiles, logging, json, uuid
+from datetime import datetime, timezone
 from db import User
+
+# OnlySq Cloud REST API v2
+API_BASE = "https://cloud.onlysq.ru"
+SHARE_UI = f"{API_BASE}/v2/ui/s"
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
 
 class UserStates(StatesGroup):
     AWAITING_FILE_UPLOAD = State()
@@ -17,60 +22,144 @@ class UserStates(StatesGroup):
 
 router = Router()
 
-async def check_token(user_token: str):
+
+# region helpers
+def _auth(user_token: str) -> dict:
+    """Build the Authorization header for API v2 Bearer auth."""
+    return {"Authorization": f"Bearer {user_token}"}
+
+
+def _human_size(num: int) -> str:
+    try:
+        num = float(num)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(num) < 1024.0:
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.2f} {unit}"
+        num /= 1024.0
+    return f"{num:.2f} PB"
+
+
+def _fmt_date(value: str) -> str:
+    if not value:
+        return "-"
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, AttributeError):
+        return value
+
+
+async def check_token(user_token: str) -> bool:
+    """Validate a token via GET /v2/me."""
+    if not user_token:
+        return False
     async with aiohttp.ClientSession() as session:
-        URL = "https://cloud.onlysq.ru/api/files"
-        async with session.get(URL, cookies={"user_token": user_token}) as response:
-            jsn = await response.json()
-            logging.info(f"Token check response status: {response.status}; Json: {jsn}")
-            return (type(jsn) == list)
+        url = f"{API_BASE}/v2/me"
+        async with session.get(url, headers=_auth(user_token)) as response:
+            logging.info(f"Token check status: {response.status}")
+            if response.status != 200:
+                return False
+            try:
+                data = await response.json()
+            except aiohttp.ContentTypeError:
+                return False
+            return bool(data.get("ok") and data.get("authenticated"))
+
+
+async def list_files(user_token: str):
+    """Return the list of files in the user's root, or None on failure."""
+    url = f"{API_BASE}/v2/files"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params={"root": 1}, headers=_auth(user_token)) as response:
+            logging.info(f"List files status: {response.status}")
+            if response.status != 200:
+                return None
+            data = await response.json()
+            if not data.get("ok"):
+                return None
+            return data.get("files", [])
+
 
 async def upload_file(file_path: str, user_token: str):
-    URL = "https://cloud.onlysq.ru/upload"
+    """POST /v2/files/upload — returns the parsed JSON or None.
+
+    Note: aiohttp's FormData needs a synchronous file object, so we read the
+    bytes with aiofiles first and hand the buffer to the multipart field.
+    """
+    url = f"{API_BASE}/v2/files/upload"
+    async with aiofiles.open(file_path, 'rb') as f:
+        content = await f.read()
     async with aiohttp.ClientSession() as session:
-        async with aiofiles.open(file_path, 'rb') as f:
-            data = aiohttp.FormData()
-            data.add_field(
-                'file',
-                f,
-                filename=os.path.basename(file_path),
-                content_type='application/octet-stream'
-            )
-            async with session.post(URL, data=data, cookies={"user_token": user_token}) as response:
-                logging.info(f"Upload response status: {response.status}; Json: {await response.text()}")
-                if response.status == 200:
-                    return await response.json()
-                else:
+        data = aiohttp.FormData()
+        data.add_field(
+            'file',
+            content,
+            filename=os.path.basename(file_path),
+            content_type='application/octet-stream'
+        )
+        async with session.post(url, data=data, headers=_auth(user_token)) as response:
+            body = await response.text()
+            logging.info(f"Upload status: {response.status}; body: {body}")
+            if response.status == 200:
+                try:
+                    return json.loads(body)
+                except (ValueError, TypeError):
                     return None
-async def get_info_file(file_id: str, user_token: str):
-    URL = f"https://cloud.onlysq.ru/api/files"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(URL, cookies={"user_token": user_token}) as response:
-            if response.status == 200:
-                files = await response.json()
-                logging.info(f"Get file info response for file_id {file_id}: {files}")
-                for file in files:
-                    if file['id'] == file_id:
-                        return file
-                return None
-            else:
-                return None
+            return None
 
-async def get_token_info(user_token: str):
-    URL = "https://cloud.onlysq.ru/files"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(URL, cookies={"user_token": user_token}) as response:
-            if response.status == 200:
-                logging.info(f"Get token info response status: {response.status}")
-                return await response.json()
-            else:
-                return None
 
+async def get_info_file(file_uid: str, user_token: str):
+    """GET /v2/files/<uid> — single file metadata."""
+    url = f"{API_BASE}/v2/files/{file_uid}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=_auth(user_token)) as response:
+            logging.info(f"File info status for {file_uid}: {response.status}")
+            if response.status != 200:
+                return None
+            data = await response.json()
+            if not data.get("ok"):
+                return None
+            # API may return {ok, file:{...}} or the file object directly
+            return data.get("file", data)
+
+
+async def create_share_link(file_uid: str, user_token: str):
+    """POST /v2/files/<uid>/share (role viewer) — returns the public share URL or None."""
+    url = f"{API_BASE}/v2/files/{file_uid}/share"
+    payload = {"role": "viewer"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=_auth(user_token)) as response:
+            logging.info(f"Share create status for {file_uid}: {response.status}")
+            if response.status not in (200, 201):
+                return None
+            data = await response.json()
+            if not data.get("ok"):
+                return None
+            token = (data.get("share") or {}).get("token")
+            return f"{SHARE_UI}/{token}" if token else None
+
+
+async def _get_user(telegram_id: int):
+    """Fetch the user row, creating it if missing. Never raises DoesNotExist."""
+    user = await User.filter(telegram_id=telegram_id).first()
+    if user is None:
+        user = await User.create(
+            telegram_id=telegram_id,
+            created_at=datetime.now(timezone.utc),
+            user_token=None,
+        )
+    return user
+
+
+
+# region help
 @router.message(Command("help"))
 async def send_help(message: Message, state: FSMContext):
     language = message.from_user.language_code
     await state.clear()
-    await message.edit_text(tm["help_message"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    await message.answer(tm["help_message"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+
 
 # region upload
 @router.callback_query(F.data == "upload")
@@ -81,7 +170,7 @@ async def callback_upload(callback_query, state: FSMContext):
     if user.user_token is None:
         await callback_query.message.edit_text(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         return
-    
+
     await callback_query.message.edit_text(tm["upload_prompt"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
     await state.set_state(UserStates.AWAITING_FILE_UPLOAD)
     await callback_query.answer()
@@ -91,16 +180,13 @@ async def prompt_upload(message: Message, state: FSMContext):
     language = message.from_user.language_code
     await state.clear()
 
-    if await User.filter(telegram_id=message.from_user.id).exists() is None:
-        await User.create(telegram_id=message.from_user.id, created_at=datetime.utcnow(), user_token=None)
-    
-    user = await User.get(telegram_id=message.from_user.id)
-    
+    user = await _get_user(message.from_user.id)
+
     if user.user_token is None:
-        await message.edit_text(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        await message.answer(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         return
-    
-    await message.edit_text(tm["upload_prompt"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+
+    await message.answer(tm["upload_prompt"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
     await state.set_state(UserStates.AWAITING_FILE_UPLOAD)
 
 # region my files
@@ -108,67 +194,54 @@ async def prompt_upload(message: Message, state: FSMContext):
 async def callback_myfiles(callback_query: CallbackQuery):
     language = callback_query.from_user.language_code
     await callback_query.message.edit_text(tm["geting_files"].get(language, "en"))
-    user = await User.filter(telegram_id=callback_query.from_user.id).get()
+    user = await _get_user(callback_query.from_user.id)
     if user.user_token is None:
         await callback_query.message.edit_text(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         return
-    URL = "https://cloud.onlysq.ru/api/files"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(URL, cookies={"user_token": user.user_token}) as response:
-            if response.status == 200:
-                files = await response.json()
-                logging.info(f"File list response for user {callback_query.from_user.id}: {files}")
-                if not files:
-                    await callback_query.message.edit_text(tm["no_files"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
-                    return
-                markup = kbs.get_files_keyboard(files, 1, language)
-                await callback_query.message.edit_text(tm["files"].get(language, "en"), reply_markup=markup)
-            else:
-                await callback_query.message.edit_text(tm["file_list_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    files = await list_files(user.user_token)
+    if files is None:
+        await callback_query.message.edit_text(tm["file_list_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    elif not files:
+        await callback_query.message.edit_text(tm["no_files"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    else:
+        markup = kbs.get_files_keyboard(files, 1, language)
+        await callback_query.message.edit_text(tm["files"].get(language, "en"), reply_markup=markup)
     await callback_query.answer()
 
 @router.message(Command("myfiles"))
 async def list_user_files(message: Message, state: FSMContext):
     language = message.from_user.language_code
     await state.clear()
-    user = await User.filter(telegram_id=message.from_user.id).get()
+    user = await _get_user(message.from_user.id)
     if user.user_token is None:
-        await message.edit_text(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        await message.answer(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         return
-    URL = "https://cloud.onlysq.ru/api/files"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(URL, cookies={"user_token": user.user_token}) as response:
-            if response.status == 200:
-                files = await response.json()
-                logging.info(f"File list response for user {message.from_user.id}: {files}")
-                if not files:
-                    await message.edit_text(tm["no_files"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
-                    return
-                markup = kbs.get_files_keyboard(files, 1, language)
-                await message.edit_text(tm["files"][language].get(language, "en"), reply_markup=markup)
-            else:
-                await message.edit_text(tm["file_list_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
-    
+    files = await list_files(user.user_token)
+    if files is None:
+        await message.answer(tm["file_list_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    elif not files:
+        await message.answer(tm["no_files"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    else:
+        markup = kbs.get_files_keyboard(files, 1, language)
+        await message.answer(tm["files"].get(language, "en"), reply_markup=markup)
+
 @router.callback_query(F.data.startswith("page_"))
 async def callback_pagination_handler(callback_query: CallbackQuery):
     next_page = int(callback_query.data.split("_")[1])
     language = callback_query.from_user.language_code
 
-    user = await User.filter(telegram_id=callback_query.from_user.id).get()
+    user = await _get_user(callback_query.from_user.id)
     if user.user_token is None:
         await callback_query.answer(tm["invalid_token"].get(language, 'en'), show_alert=True)
         return
 
-    URL = "https://cloud.onlysq.ru/api/files"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(URL, cookies={"user_token": user.user_token}) as response:
-            if response.status == 200:
-                files = await response.json()
-                markup = kbs.get_files_keyboard(files, next_page, language)
-                await callback_query.message.edit_reply_markup(reply_markup=markup)
-            else:
-                await callback_query.answer(tm["file_list_failure"].get(language, "en"), show_alert=True)
-    
+    files = await list_files(user.user_token)
+    if files is None:
+        await callback_query.answer(tm["file_list_failure"].get(language, "en"), show_alert=True)
+    else:
+        markup = kbs.get_files_keyboard(files, next_page, language)
+        await callback_query.message.edit_reply_markup(reply_markup=markup)
+
     await callback_query.answer()
 
 # region menu
@@ -185,9 +258,9 @@ async def callback_menu(callback_query: CallbackQuery, state: FSMContext):
 async def callback_settings(callback_query: CallbackQuery):
     language = callback_query.from_user.language_code
     markup = kbs.get_settings_keyboard(language)
-    user = await User.get(telegram_id=callback_query.from_user.id)
+    user = await _get_user(callback_query.from_user.id)
     user_token = user.user_token if user.user_token else "Not set"
-    await callback_query.message.edit_text(tm["settings_message"].get(language, "en").format(user_token) , reply_markup=markup)
+    await callback_query.message.edit_text(tm["settings_message"].get(language, "en").format(user_token), reply_markup=markup)
     await callback_query.answer()
 
 # region set token
@@ -205,107 +278,119 @@ async def set_user_token(message: Message):
     try:
         token = message.text.split(" ")[1]
     except IndexError:
-        await message.edit_text("Please provide a token. Usage: /settoken YOUR_TOKEN", reply_markup=kbs.get_menu_keyboard(language))
+        await message.answer("Please provide a token. Usage: /settoken YOUR_TOKEN", reply_markup=kbs.get_menu_keyboard(language))
         return
     if not await check_token(token):
-        await message.edit_text(tm["invalid_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        await message.answer(tm["invalid_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         return
-    if await User.filter(telegram_id=message.from_user.id).exists() is None:
-        await User.create(telegram_id=message.from_user.id, created_at=datetime.utcnow(), user_token=token)
+    if not await User.filter(telegram_id=message.from_user.id).exists():
+        await User.create(telegram_id=message.from_user.id, created_at=datetime.now(timezone.utc), user_token=token)
     else:
         user = await User.get(telegram_id=message.from_user.id)
         user.user_token = token
         await user.save()
-    
-    await message.edit_text(tm["token_set_success"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+
+    await message.answer(tm["token_set_success"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
 
 # region awaiting file upload
 @router.message(UserStates.AWAITING_FILE_UPLOAD)
-async def handle_file_upload(message, state: FSMContext, bot: Bot):
+async def handle_file_upload(message: Message, state: FSMContext, bot: Bot):
     language = message.from_user.language_code
-    if type(message) == CallbackQuery:
-        message = message.message
-    msg = await message.answer(tm['uploading_file'].get(language, 'en'))
-    
-    user = await User.filter(telegram_id=message.from_user.id).get()
+    await message.answer(tm['uploading_file'].get(language, 'en'))
+
+    user = await _get_user(message.from_user.id)
+    if user.user_token is None:
+        await message.answer(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        await state.clear()
+        return
+
+    os.makedirs("downloads", exist_ok=True)
+    # Unique temp prefix so concurrent/retried uploads never clobber each other.
+    prefix = f"downloads/{message.from_user.id}_{uuid.uuid4().hex[:8]}_"
     file_path = None
-    
+
+    def _too_big(size) -> bool:
+        return (size or 0) > MAX_FILE_SIZE
+
     try:
-        os.makedirs("downloads", exist_ok=True)
         # Handle document
         if message.document:
-            file_id = message.document.file_id
-            file = await bot.get_file(file_id)
-            if message.document.file_size > 2 * 1024 * 1024 * 1024:
+            if _too_big(message.document.file_size):
                 await message.answer("File size exceeds 2 GB limit.", reply_markup=kbs.get_menu_keyboard(language))
                 await state.clear()
                 return
-            file_path = f"downloads/{message.document.file_name}"
+            file = await bot.get_file(message.document.file_id)
+            safe_name = os.path.basename(message.document.file_name or "file")
+            file_path = prefix + safe_name
             await bot.download_file(file.file_path, destination=file_path, timeout=600)
-        
+
         # Handle photo
         elif message.photo:
-            file_id = message.photo[-1].file_id
-            file = await bot.get_file(file_id)
-            if message.photo[-1].file_size > 2 * 1024 * 1024 * 1024:
+            if _too_big(message.photo[-1].file_size):
                 await message.answer("File size exceeds 2 GB limit.", reply_markup=kbs.get_menu_keyboard(language))
                 await state.clear()
                 return
-            file_path = f"downloads/photo_{message.from_user.id}.jpg"
+            file = await bot.get_file(message.photo[-1].file_id)
+            file_path = prefix + "photo.jpg"
             await bot.download_file(file.file_path, destination=file_path, timeout=600)
-        
+
         # Handle video
         elif message.video:
-            file_id = message.video.file_id
-            file = await bot.get_file(file_id)
-            if message.video.file_size > 2 * 1024 * 1024 * 1024:
+            if _too_big(message.video.file_size):
                 await message.answer("File size exceeds 2 GB limit.", reply_markup=kbs.get_menu_keyboard(language))
                 await state.clear()
                 return
-            file_path = f"downloads/video_{message.from_user.id}.mp4"
+            file = await bot.get_file(message.video.file_id)
+            file_path = prefix + "video.mp4"
             await bot.download_file(file.file_path, destination=file_path, timeout=600)
-        
+
         # Handle audio
         elif message.audio:
-            file_id = message.audio.file_id
-            file = await bot.get_file(file_id)
-            if message.audio.file_size > 2 * 1024 * 1024 * 1024:
+            if _too_big(message.audio.file_size):
                 await message.answer("File size exceeds 2 GB limit.", reply_markup=kbs.get_menu_keyboard(language))
                 await state.clear()
                 return
-            file_path = f"downloads/audio_{message.from_user.id}.mp3"
+            file = await bot.get_file(message.audio.file_id)
+            file_path = prefix + "audio.mp3"
             await bot.download_file(file.file_path, destination=file_path, timeout=600)
-        
+
         # Handle text
         elif message.text:
-            file_path = f"downloads/text_{message.from_user.id}.txt"
+            file_path = prefix + "text.txt"
             async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
                 await f.write(message.text)
-        
+
         else:
             await message.answer(tm["upload_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
             await state.clear()
             return
-        
+
         # Upload file to server
         response = await upload_file(file_path, user.user_token)
         if response and response.get("ok"):
-            _id = response.get("url").split("/")[-1]
-            link = f"https://cloud.onlysq.ru/file/{_id}"
-            logging.info(f"File uploaded for user {message.from_user.id}: {response}")
-            await message.answer(tm["upload_success"].get(language, "en").format(_id, link, link+"?mode=dl", link+"?mode=view"), reply_markup=kbs.get_menu_keyboard(language))
+            file_obj = response.get("file", {})
+            uid = file_obj.get("uid", "?")
+            name = file_obj.get("name", os.path.basename(file_path))
+            size = _human_size(file_obj.get("size", 0))
+            share_link = await create_share_link(uid, user.user_token) or "-"
+            logging.info(f"File uploaded for user {message.from_user.id}: {uid}")
+            await message.answer(
+                tm["upload_success"].get(language, "en").format(uid, name, size, share_link),
+                reply_markup=kbs.get_menu_keyboard(language)
+            )
         else:
             await message.answer(tm["upload_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
-        
-        # Clean up
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-    
+
     except Exception as e:
         logging.error(f"Upload error for user {message.from_user.id}: {e}")
         await message.answer(tm["upload_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
-    
-    await state.clear()
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError as e:
+                logging.warning(f"Failed to remove temp file {file_path}: {e}")
+        await state.clear()
 
 # region awaiting token input
 @router.message(UserStates.AWAITING_TOKEN_INPUT)
@@ -315,13 +400,13 @@ async def handle_token_input(message: Message, state: FSMContext):
     if not await check_token(token):
         await message.answer(tm["invalid_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         return
-    if await User.filter(telegram_id=message.from_user.id).exists() is None:
-        await User.create(telegram_id=message.from_user.id, created_at=datetime.utcnow(), user_token=token)
+    if not await User.filter(telegram_id=message.from_user.id).exists():
+        await User.create(telegram_id=message.from_user.id, created_at=datetime.now(timezone.utc), user_token=token)
     else:
         user = await User.get(telegram_id=message.from_user.id)
         user.user_token = token
         await user.save()
-    
+
     await message.answer(tm["token_set_success"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
     await state.clear()
 
@@ -329,28 +414,52 @@ async def handle_token_input(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("file_"))
 async def callback_file_details(callback_query: CallbackQuery):
     language = callback_query.from_user.language_code
-    file_id = callback_query.data.split("_")[1]
-    link = f"https://cloud.onlysq.ru/file/{file_id}"
-    file_info = await get_info_file(file_id, (await User.get(telegram_id=callback_query.from_user.id)).user_token)
+    file_uid = callback_query.data.split("_", 1)[1]
+    user = await _get_user(callback_query.from_user.id)
+    if user.user_token is None:
+        await callback_query.answer(tm["invalid_token"].get(language, "en"), show_alert=True)
+        return
+    file_info = await get_info_file(file_uid, user.user_token)
+    if not file_info:
+        await callback_query.answer(tm["file_list_failure"].get(language, "en"), show_alert=True)
+        return
+    share_link = await create_share_link(file_uid, user.user_token) or "-"
     await callback_query.message.edit_text(
-        tm["file_details"].get(language, "en").format(file_info['name'], file_info['views'], file_info['unique'], link, link+"?mode=dl", link+"?mode=view"),
-        reply_markup=kbs.get_file_action_keyboard(file_id, language)
+        tm["file_details"].get(language, "en").format(
+            file_info.get("name", "?"),
+            _human_size(file_info.get("size", 0)),
+            file_info.get("mime", "-"),
+            file_info.get("views", 0),
+            _fmt_date(file_info.get("created_at", "")),
+            share_link,
+        ),
+        reply_markup=kbs.get_file_action_keyboard(file_uid, language)
     )
 
 @router.callback_query(F.data.startswith("download_"))
 async def callback_file_download(callback_query: CallbackQuery):
     language = callback_query.from_user.language_code
-    file_id = callback_query.data.split("_")[1]
-    download_link = f"https://cloud.onlysq.ru/file/{file_id}?mode=dl"
-    file_info = await get_info_file(file_id, (await User.get(telegram_id=callback_query.from_user.id)).user_token)
+    file_uid = callback_query.data.split("_", 1)[1]
+    user = await _get_user(callback_query.from_user.id)
+    if user.user_token is None:
+        await callback_query.answer(tm["invalid_token"].get(language, "en"), show_alert=True)
+        return
+    file_info = await get_info_file(file_uid, user.user_token)
+    if not file_info:
+        await callback_query.answer(tm["file_download_failure"].get(language, "en"), show_alert=True)
+        return
+
+    download_url = f"{API_BASE}/v2/files/{file_uid}/stream"
+    file_name = os.path.basename(file_info.get("name") or file_uid)
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(download_link) as response:
-            response.raise_for_status()
-            content_disposition = response.headers.get('Content-Disposition')
+        async with session.get(download_url, params={"mode": "dl"}, headers=_auth(user.user_token)) as response:
+            if response.status != 200:
+                await callback_query.answer(tm["file_download_failure"].get(language, "en"), show_alert=True)
+                return
 
             os.makedirs("downloads", exist_ok=True)
-            destination_path = os.path.join("downloads", file_info['name'])
+            destination_path = os.path.join("downloads", file_name)
 
             try:
                 async with aiofiles.open(destination_path, 'wb') as file:
@@ -358,29 +467,32 @@ async def callback_file_download(callback_query: CallbackQuery):
                         await file.write(chunk)
                 async with aiofiles.open(destination_path, 'rb') as file:
                     file_content = await file.read()
-                file_content = BufferedInputFile(file_content, filename=file_info['name'])
-                await callback_query.message.answer_document(document=file_content, filename=file_info['name'])
+                file_content = BufferedInputFile(file_content, filename=file_name)
+                await callback_query.message.answer_document(document=file_content)
                 os.remove(destination_path)
             except IOError as e:
-                logging.error(f"Failed to write file {file_info['name']}: {e}")
+                logging.error(f"Failed to write file {file_name}: {e}")
                 await callback_query.message.answer(tm["file_download_failure"].get(language, "en"))
     await callback_query.answer()
 
 @router.callback_query(F.data.startswith("delete_"))
 async def callback_file_delete(callback_query: CallbackQuery):
     language = callback_query.from_user.language_code
-    file_id = callback_query.data.split("_")[1]
-    URL = f"https://cloud.onlysq.ru/file/{file_id}"
-    user = await User.get(telegram_id=callback_query.from_user.id)
-    file_info = await get_info_file(file_id, user.user_token)
+    file_uid = callback_query.data.split("_", 1)[1]
+    user = await _get_user(callback_query.from_user.id)
+    if user.user_token is None:
+        await callback_query.answer(tm["invalid_token"].get(language, "en"), show_alert=True)
+        return
+    url = f"{API_BASE}/v2/files/{file_uid}"
     async with aiohttp.ClientSession() as session:
-        headers = {
-            "Authorization": file_info['owner_key']
-        }
-        async with session.delete(URL, headers=headers) as response:
-            resp_json = await response.json()
-            logging.info(f"Delete file response for user {callback_query.from_user.id}: {resp_json}")
-            if resp_json.get("ok"):
+        async with session.delete(url, headers=_auth(user.user_token)) as response:
+            logging.info(f"Delete file {file_uid} status for user {callback_query.from_user.id}: {response.status}")
+            ok = False
+            try:
+                ok = response.status == 200 and (await response.json()).get("ok", False)
+            except aiohttp.ContentTypeError:
+                ok = response.status == 200
+            if ok:
                 await callback_query.message.edit_text(tm["file_delete_success"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
             else:
                 await callback_query.message.edit_text(tm["file_delete_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
@@ -388,17 +500,10 @@ async def callback_file_delete(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "generate_token")
 async def callback_gentoken(callback_query: CallbackQuery):
+    # API v2 tokens are created in the web UI; show instructions instead of auto-generating.
     language = callback_query.from_user.language_code
-    user = await User.get(telegram_id=callback_query.from_user.id)
-    async with aiohttp.ClientSession() as session:
-        URL = "https://cloud.onlysq.ru/"
-        async with session.get(URL) as response:
-            if response.status == 200:
-                cookies = response.cookies
-                user_token = cookies.get("user_token").value
-                user.user_token = user_token
-                await user.save()
-                await callback_query.message.edit_text(tm["token_generated_success"].get(language, "en").format(user_token), reply_markup=kbs.get_menu_keyboard(language))
-            else:
-                await callback_query.message.edit_text(tm["file_delete_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    await callback_query.message.edit_text(
+        tm["generate_token_info"].get(language, "en"),
+        reply_markup=kbs.get_menu_keyboard(language)
+    )
     await callback_query.answer()

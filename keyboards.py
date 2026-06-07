@@ -31,7 +31,7 @@ def get_files_keyboard(
         buttons.append([
             InlineKeyboardButton(
                 text=file['name'],
-                callback_data=f"file_{file['id']}"
+                callback_data=f"file_{file['uid']}"
             )
         ])
 
