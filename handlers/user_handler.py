@@ -22,6 +22,7 @@ async def check_token(user_token: str):
         URL = "https://cloud.onlysq.ru/api/files"
         async with session.get(URL, cookies={"user_token": user_token}) as response:
             jsn = await response.json()
+            logging.info(f"Token check response status: {response.status}; Json: {jsn}")
             return (type(jsn) == list)
 
 async def upload_file(file_path: str, user_token: str):
@@ -47,6 +48,7 @@ async def get_info_file(file_id: str, user_token: str):
         async with session.get(URL, cookies={"user_token": user_token}) as response:
             if response.status == 200:
                 files = await response.json()
+                logging.info(f"Get file info response for file_id {file_id}: {files}")
                 for file in files:
                     if file['id'] == file_id:
                         return file
@@ -59,6 +61,7 @@ async def get_token_info(user_token: str):
     async with aiohttp.ClientSession() as session:
         async with session.get(URL, cookies={"user_token": user_token}) as response:
             if response.status == 200:
+                logging.info(f"Get token info response status: {response.status}")
                 return await response.json()
             else:
                 return None
@@ -114,6 +117,7 @@ async def callback_myfiles(callback_query: CallbackQuery):
         async with session.get(URL, cookies={"user_token": user.user_token}) as response:
             if response.status == 200:
                 files = await response.json()
+                logging.info(f"File list response for user {callback_query.from_user.id}: {files}")
                 if not files:
                     await callback_query.message.edit_text(tm["no_files"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
                     return
@@ -136,6 +140,7 @@ async def list_user_files(message: Message, state: FSMContext):
         async with session.get(URL, cookies={"user_token": user.user_token}) as response:
             if response.status == 200:
                 files = await response.json()
+                logging.info(f"File list response for user {message.from_user.id}: {files}")
                 if not files:
                     await message.edit_text(tm["no_files"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
                     return
@@ -143,7 +148,7 @@ async def list_user_files(message: Message, state: FSMContext):
                 await message.edit_text(tm["files"][language].get(language, "en"), reply_markup=markup)
             else:
                 await message.edit_text(tm["file_list_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
-
+    
 @router.callback_query(F.data.startswith("page_"))
 async def callback_pagination_handler(callback_query: CallbackQuery):
     next_page = int(callback_query.data.split("_")[1])

@@ -207,3 +207,10 @@ marimo/_lsp/
 __marimo__/
 
 database*
+
+# telegram-bot-api runtime data & binaries
+*.binlog
+telegram-bot-api
+telegram-bot-api.exe
+# bot working dirs named <bot_id>:<bot_token>
+[0-9]*:*/

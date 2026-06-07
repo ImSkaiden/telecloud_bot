@@ -21,7 +21,7 @@ from db import User
 
 load_dotenv()
 TOKEN = os.getenv("TOKEN") or ""
-LOCAL_TAPI = bool(os.getenv("LOCAL_TAPI", False).lower() == 'true')
+LOCAL_TAPI = os.getenv("LOCAL_TAPI", "false").lower() == "true"
 LOCAL_TAPI_URL = os.getenv("LOCAL_TAPI_URL", "http://localhost:8000")
 
 if TOKEN == "":
@@ -30,8 +30,10 @@ if TOKEN == "":
 
 dp = Dispatcher()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 TORTOISE_ORM = {
-    "connections": {"default": "sqlite://database.sqlite3"},
+    "connections": {"default": f"sqlite://{os.path.join(BASE_DIR, 'database.sqlite3')}"},
     "apps": {
         "models": {
             "models": ["db"], # Список модулей, где лежат модели (например, ["models", "handlers.other_models"])
