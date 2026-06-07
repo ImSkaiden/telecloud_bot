@@ -1,0 +1,27 @@
+services:
+  # Сервис локального Bot API
+  telegram-api:
+    build: .
+    container_name: telegram_api_server
+    command: ./start.sh
+    env_file:
+      - .env
+    ports:
+      - "8731:8731"
+    volumes:
+      - .:/app
+    restart: always
+
+  # Сервис вашего бота
+  app:
+    build: .
+    container_name: python_app
+    depends_on:
+      - telegram-api
+    env_file:
+      - .env
+    environment:
+      - TELEGRAM_API_URL=http://telegram-api:8731
+    volumes:
+      - .:/app
+    restart: always
