@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, html
@@ -52,11 +52,15 @@ async def init_db():
 @dp.message(CommandStart())
 async def send_welcome(message: Message):
     language = message.from_user.language_code
-    if await User.filter(telegram_id=message.from_user.id).exists() is False:
-        await User.create(telegram_id=message.from_user.id, created_at=datetime.utcnow(), user_token=None)
+    user = await User.filter(telegram_id=message.from_user.id).first()
+    if user is None:
+        user = await User.create(telegram_id=message.from_user.id, created_at=datetime.now(timezone.utc), user_token=None)
     logging.info(f"User {message.from_user.id} started the bot with language {language}")
     markup = get_welcome_keyboard(language)
     await message.answer(tm["start_message"].get(language, "en"), reply_markup=markup)
+    # Onboarding: nudge users without a token to create one.
+    if user.user_token is None:
+        await message.answer(tm["generate_token_info"].get(language, "en"))
 
 async def on_startup():
     logging.info(f"Bot has started.")

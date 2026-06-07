@@ -19,6 +19,14 @@ translations_messages = {
         "en": "Failed to upload the file. Please try again later and check your token.",
         "ru": "Не удалось загрузить файл. Пожалуйста, попробуйте позже и проверьте свой токен."
     },
+    "upload_quota": {
+        "en": "Upload failed: quota exceeded or file too large.",
+        "ru": "Не удалось загрузить: превышена квота или файл слишком большой."
+    },
+    "upload_tg_fail": {
+        "en": "Telegram temporarily failed to process the file. Please try again.",
+        "ru": "Telegram временно не смог обработать файл. Попробуйте ещё раз."
+    },
     "upload_no_token": {
         "en": "You need to set your API token before uploading files.\nCreate one at https://cloud.onlysq.ru/v2/ui/settings and send it via /settoken.",
         "ru": "Вам нужно установить API-токен перед загрузкой файлов.\nСоздайте его на https://cloud.onlysq.ru/v2/ui/settings и отправьте через /settoken."
@@ -46,6 +54,10 @@ translations_messages = {
     "settings_message": {
         "en": "Settings:\nAPI token: <span class='tg-spoiler'>{}</span>",
         "ru": "Настройки:\nAPI-токен: <span class='tg-spoiler'>{}</span>"
+    },
+    "quota_line": {
+        "en": "Storage: {} / {} used",
+        "ru": "Хранилище: {} / {} использовано"
     },
     "file_details": {
         "en": "File Name: {}\nSize: {}\nType: {}\nViews: {}\nUploaded: {}\nShare link: {}",

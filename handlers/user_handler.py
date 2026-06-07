@@ -9,12 +9,21 @@ from translations import translations_buttons as tb
 import keyboards as kbs
 import aiohttp, os, aiofiles, logging, json, uuid
 from datetime import datetime, timezone
+from aiogram.exceptions import TelegramBadRequest
 from db import User
 
 # OnlySq Cloud REST API v2
 API_BASE = "https://cloud.onlysq.ru"
 SHARE_UI = f"{API_BASE}/v2/ui/s"
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+
+# Network timeouts (seconds). Uploads/downloads need a long total budget.
+TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+TIMEOUT_UPLOAD = aiohttp.ClientTimeout(total=900, connect=10)
+
+# In-memory cache of share URLs: file uid -> public share url.
+# Share tokens are stable server-side, so reusing avoids spawning new ones.
+_share_cache: dict[str, str] = {}
 
 class UserStates(StatesGroup):
     AWAITING_FILE_UPLOAD = State()
@@ -27,6 +36,19 @@ router = Router()
 def _auth(user_token: str) -> dict:
     """Build the Authorization header for API v2 Bearer auth."""
     return {"Authorization": f"Bearer {user_token}"}
+
+
+async def _safe_edit(message, text: str, reply_markup=None):
+    """Edit a message, falling back to a new message if it can't be edited
+    (too old, not modified, not editable). Avoids uncaught TelegramBadRequest."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest:
+        try:
+            await message.answer(text, reply_markup=reply_markup)
+        except TelegramBadRequest as e:
+            logging.warning(f"_safe_edit fallback failed: {e}")
+
 
 
 def _human_size(num: int) -> str:
@@ -58,7 +80,7 @@ async def check_token(user_token: str) -> bool:
     """
     if not user_token:
         return False
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
         url = f"{API_BASE}/v2/quota"
         async with session.get(url, headers=_auth(user_token)) as response:
             logging.info(f"Token check status: {response.status}")
@@ -71,10 +93,21 @@ async def check_token(user_token: str) -> bool:
             return bool(data.get("ok"))
 
 
+async def get_quota(user_token: str):
+    """GET /v2/quota -> {used_bytes, quota_bytes, free_bytes} or None."""
+    url = f"{API_BASE}/v2/quota"
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+        async with session.get(url, headers=_auth(user_token)) as response:
+            if response.status != 200:
+                return None
+            data = await response.json()
+            return data if data.get("ok") else None
+
+
 async def list_files(user_token: str):
     """Return the list of files in the user's root, or None on failure."""
     url = f"{API_BASE}/v2/files"
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
         async with session.get(url, params={"root": 1}, headers=_auth(user_token)) as response:
             logging.info(f"List files status: {response.status}")
             if response.status != 200:
@@ -86,15 +119,15 @@ async def list_files(user_token: str):
 
 
 async def upload_file(file_path: str, user_token: str):
-    """POST /v2/files/upload — returns the parsed JSON or None.
+    """POST /v2/files/upload — returns (parsed_json_or_None, status_code).
 
-    Note: aiohttp's FormData needs a synchronous file object, so we read the
-    bytes with aiofiles first and hand the buffer to the multipart field.
+    Note: aiohttp's FormData needs a synchronous buffer, so we read the bytes
+    with aiofiles first and hand the buffer to the multipart field.
     """
     url = f"{API_BASE}/v2/files/upload"
     async with aiofiles.open(file_path, 'rb') as f:
         content = await f.read()
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=TIMEOUT_UPLOAD) as session:
         data = aiohttp.FormData()
         data.add_field(
             'file',
@@ -105,18 +138,18 @@ async def upload_file(file_path: str, user_token: str):
         async with session.post(url, data=data, headers=_auth(user_token)) as response:
             body = await response.text()
             logging.info(f"Upload status: {response.status}; body: {body}")
-            if response.status == 200:
-                try:
-                    return json.loads(body)
-                except (ValueError, TypeError):
-                    return None
-            return None
+            parsed = None
+            try:
+                parsed = json.loads(body)
+            except (ValueError, TypeError):
+                parsed = None
+            return parsed, response.status
 
 
 async def get_info_file(file_uid: str, user_token: str):
     """GET /v2/files/<uid> — single file metadata."""
     url = f"{API_BASE}/v2/files/{file_uid}"
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
         async with session.get(url, headers=_auth(user_token)) as response:
             logging.info(f"File info status for {file_uid}: {response.status}")
             if response.status != 200:
@@ -129,10 +162,15 @@ async def get_info_file(file_uid: str, user_token: str):
 
 
 async def create_share_link(file_uid: str, user_token: str):
-    """POST /v2/files/<uid>/share (role viewer) — returns the public share URL or None."""
+    """POST /v2/files/<uid>/share (role viewer) — returns the public share URL or None.
+
+    Cached in-memory per uid so we don't spawn a fresh share token on every view.
+    """
+    if file_uid in _share_cache:
+        return _share_cache[file_uid]
     url = f"{API_BASE}/v2/files/{file_uid}/share"
     payload = {"role": "viewer"}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
         async with session.post(url, json=payload, headers=_auth(user_token)) as response:
             logging.info(f"Share create status for {file_uid}: {response.status}")
             if response.status not in (200, 201):
@@ -141,7 +179,11 @@ async def create_share_link(file_uid: str, user_token: str):
             if not data.get("ok"):
                 return None
             token = (data.get("share") or {}).get("token")
-            return f"{SHARE_UI}/{token}" if token else None
+            if not token:
+                return None
+            share_url = f"{SHARE_UI}/{token}"
+            _share_cache[file_uid] = share_url
+            return share_url
 
 
 async def _get_user(telegram_id: int):
@@ -172,10 +214,10 @@ async def callback_upload(callback_query, state: FSMContext):
 
     user = await User.get(telegram_id=callback_query.from_user.id)
     if user.user_token is None:
-        await callback_query.message.edit_text(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        await _safe_edit(callback_query.message, tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         return
 
-    await callback_query.message.edit_text(tm["upload_prompt"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    await _safe_edit(callback_query.message, tm["upload_prompt"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
     await state.set_state(UserStates.AWAITING_FILE_UPLOAD)
     await callback_query.answer()
 
@@ -197,19 +239,19 @@ async def prompt_upload(message: Message, state: FSMContext):
 @router.callback_query(F.data == "myfiles")
 async def callback_myfiles(callback_query: CallbackQuery):
     language = callback_query.from_user.language_code
-    await callback_query.message.edit_text(tm["geting_files"].get(language, "en"))
+    await _safe_edit(callback_query.message, tm["geting_files"].get(language, "en"))
     user = await _get_user(callback_query.from_user.id)
     if user.user_token is None:
-        await callback_query.message.edit_text(tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        await _safe_edit(callback_query.message, tm["upload_no_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         return
     files = await list_files(user.user_token)
     if files is None:
-        await callback_query.message.edit_text(tm["file_list_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        await _safe_edit(callback_query.message, tm["file_list_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
     elif not files:
-        await callback_query.message.edit_text(tm["no_files"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        await _safe_edit(callback_query.message, tm["no_files"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
     else:
         markup = kbs.get_files_keyboard(files, 1, language)
-        await callback_query.message.edit_text(tm["files"].get(language, "en"), reply_markup=markup)
+        await _safe_edit(callback_query.message, tm["files"].get(language, "en"), reply_markup=markup)
     await callback_query.answer()
 
 @router.message(Command("myfiles"))
@@ -253,7 +295,7 @@ async def callback_pagination_handler(callback_query: CallbackQuery):
 async def callback_menu(callback_query: CallbackQuery, state: FSMContext):
     language = callback_query.from_user.language_code
     markup = kbs.get_welcome_keyboard(language)
-    await callback_query.message.edit_text(tm["start_message"].get(language, "en"), reply_markup=markup)
+    await _safe_edit(callback_query.message, tm["start_message"].get(language, "en"), reply_markup=markup)
     await callback_query.answer()
     await state.clear()
 
@@ -264,7 +306,15 @@ async def callback_settings(callback_query: CallbackQuery):
     markup = kbs.get_settings_keyboard(language)
     user = await _get_user(callback_query.from_user.id)
     user_token = user.user_token if user.user_token else "Not set"
-    await callback_query.message.edit_text(tm["settings_message"].get(language, "en").format(user_token), reply_markup=markup)
+    text = tm["settings_message"].get(language, "en").format(user_token)
+    # Append quota usage if the token is valid.
+    if user.user_token:
+        quota = await get_quota(user.user_token)
+        if quota:
+            used = _human_size(quota.get("used_bytes", 0))
+            total = _human_size(quota.get("quota_bytes", 0))
+            text += "\n" + tm["quota_line"].get(language, "en").format(used, total)
+    await _safe_edit(callback_query.message, text, reply_markup=markup)
     await callback_query.answer()
 
 # region set token
@@ -272,7 +322,7 @@ async def callback_settings(callback_query: CallbackQuery):
 async def callback_settoken(callback_query: CallbackQuery, state: FSMContext):
     language = callback_query.from_user.language_code
     await state.clear()
-    await callback_query.message.edit_text(tm["set_token_prompt"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+    await _safe_edit(callback_query.message, tm["set_token_prompt"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
     await state.set_state(UserStates.AWAITING_TOKEN_INPUT)
     await callback_query.answer()
 
@@ -370,8 +420,8 @@ async def handle_file_upload(message: Message, state: FSMContext, bot: Bot):
             return
 
         # Upload file to server
-        response = await upload_file(file_path, user.user_token)
-        if response and response.get("ok"):
+        response, status = await upload_file(file_path, user.user_token)
+        if status == 200 and response and response.get("ok"):
             file_obj = response.get("file", {})
             uid = file_obj.get("uid", "?")
             name = file_obj.get("name", os.path.basename(file_path))
@@ -382,6 +432,12 @@ async def handle_file_upload(message: Message, state: FSMContext, bot: Bot):
                 tm["upload_success"].get(language, "en").format(uid, name, size, share_link),
                 reply_markup=kbs.get_menu_keyboard(language)
             )
+        elif status == 413:
+            await message.answer(tm["upload_quota"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        elif status == 502:
+            await message.answer(tm["upload_tg_fail"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+        elif status == 401:
+            await message.answer(tm["invalid_token"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
         else:
             await message.answer(tm["upload_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
 
@@ -428,7 +484,7 @@ async def callback_file_details(callback_query: CallbackQuery):
         await callback_query.answer(tm["file_list_failure"].get(language, "en"), show_alert=True)
         return
     share_link = await create_share_link(file_uid, user.user_token) or "-"
-    await callback_query.message.edit_text(
+    await _safe_edit(callback_query.message, 
         tm["file_details"].get(language, "en").format(
             file_info.get("name", "?"),
             _human_size(file_info.get("size", 0)),
@@ -456,7 +512,7 @@ async def callback_file_download(callback_query: CallbackQuery):
     download_url = f"{API_BASE}/v2/files/{file_uid}/stream"
     file_name = os.path.basename(file_info.get("name") or file_uid)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=TIMEOUT_UPLOAD) as session:
         async with session.get(download_url, params={"mode": "dl"}, headers=_auth(user.user_token)) as response:
             if response.status != 200:
                 await callback_query.answer(tm["file_download_failure"].get(language, "en"), show_alert=True)
@@ -488,7 +544,7 @@ async def callback_file_delete(callback_query: CallbackQuery):
         await callback_query.answer(tm["invalid_token"].get(language, "en"), show_alert=True)
         return
     url = f"{API_BASE}/v2/files/{file_uid}"
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
         async with session.delete(url, headers=_auth(user.user_token)) as response:
             logging.info(f"Delete file {file_uid} status for user {callback_query.from_user.id}: {response.status}")
             ok = False
@@ -497,16 +553,17 @@ async def callback_file_delete(callback_query: CallbackQuery):
             except aiohttp.ContentTypeError:
                 ok = response.status == 200
             if ok:
-                await callback_query.message.edit_text(tm["file_delete_success"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+                _share_cache.pop(file_uid, None)
+                await _safe_edit(callback_query.message, tm["file_delete_success"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
             else:
-                await callback_query.message.edit_text(tm["file_delete_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
+                await _safe_edit(callback_query.message, tm["file_delete_failure"].get(language, "en"), reply_markup=kbs.get_menu_keyboard(language))
     await callback_query.answer()
 
 @router.callback_query(F.data == "generate_token")
 async def callback_gentoken(callback_query: CallbackQuery):
     # API v2 tokens are created in the web UI; show instructions instead of auto-generating.
     language = callback_query.from_user.language_code
-    await callback_query.message.edit_text(
+    await _safe_edit(callback_query.message, 
         tm["generate_token_info"].get(language, "en"),
         reply_markup=kbs.get_menu_keyboard(language)
     )
