@@ -51,11 +51,15 @@ def _fmt_date(value: str) -> str:
 
 
 async def check_token(user_token: str) -> bool:
-    """Validate a token via GET /v2/me."""
+    """Validate a Bearer token via GET /v2/quota.
+
+    /v2/me (alias /auth/me) does NOT accept the Bearer token (it is for the
+    SAuth cookie session), so we hit a real Bearer-protected endpoint instead.
+    """
     if not user_token:
         return False
     async with aiohttp.ClientSession() as session:
-        url = f"{API_BASE}/v2/me"
+        url = f"{API_BASE}/v2/quota"
         async with session.get(url, headers=_auth(user_token)) as response:
             logging.info(f"Token check status: {response.status}")
             if response.status != 200:
@@ -64,7 +68,7 @@ async def check_token(user_token: str) -> bool:
                 data = await response.json()
             except aiohttp.ContentTypeError:
                 return False
-            return bool(data.get("ok") and data.get("authenticated"))
+            return bool(data.get("ok"))
 
 
 async def list_files(user_token: str):
